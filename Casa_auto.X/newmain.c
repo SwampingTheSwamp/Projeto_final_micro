@@ -1,6 +1,7 @@
-
 #include <xc.h>
-#include "nxlcd.h"
+#include <stdint.h>
+#include <stdio.h>
+#include "nxlcd.h" 
 
 #pragma config CPUDIV = OSC1_PLL2
 #pragma config FOSC = HS
@@ -12,6 +13,7 @@
 
 #define _XTAL_FREQ 20000000
 
+char buffer[16];
 void __interrupt() ISR(void)
 {
     if(INTCONbits.TMR0IF == 1)
@@ -21,13 +23,17 @@ void __interrupt() ISR(void)
 
         INTCONbits.TMR0IF = 0;
     }
+    
 }
 
 void main(void)
 {
     TRISE = 0x00;
     TRISD = 0x00;
-
+    TRISC = 0b00000100;
+   // ADCON0 = Ob00010101;
+    //ADCON1 = Ob00011011;
+    //ADCON2 = Ob00110110;
     TRISBbits.RB0 = 1;
     TRISBbits.RB1 = 1;
     TRISBbits.RB2 = 1;
@@ -44,9 +50,9 @@ void main(void)
     TMR0L = 0x69;
 
     INTCONbits.TMR0IF = 0;// Limpa flag
-    INTCONbits.TMR0IE = 1;// Habilita interrupção Timer0
+    INTCONbits.TMR0IE = 1;// Habilita interrupÃ§Ã£o Timer0
 
-    // Habilita interrupções globais
+    // Habilita interrupÃ§Ãµes globais
     INTCONbits.GIE = 1;
     INTCONbits.PEIE = 1;
     
@@ -58,7 +64,12 @@ void main(void)
     __delay_ms(2);
 
     WriteCmdXLCD(0x0C);
-
+    
+    WriteCmdXLCD(0x80);
+    putsXLCD(" Menu da casa  ");
+    WriteCmdXLCD(0xC0);
+    putsXLCD("   Bem vindo   ");
+    __delay_ms(500);
    while(1)
 {
     if(PORTBbits.RB0 == 0)
@@ -90,19 +101,31 @@ void main(void)
             while(PORTBbits.RB1 == 0);
         }
     }
-
-    if(menu != menu_anterior)
+    
+    if(PORTBbits.RB2 == 0)
     {
-        WriteCmdXLCD(0x01);
+         WriteCmdXLCD(0x01);
         __delay_ms(2);
-
+        //if((PORTBbits.RB1 == 0)||(PORTBbits.RB1 == 0)||(PORTBbits.RB1 == 0)){
         switch(menu)
         {
             case 0:
-                WriteCmdXLCD(0x80);
-                putsXLCD("> Iluminacao");
-                WriteCmdXLCD(0xC0);
-                putsXLCD("  Temperatura");
+                ADCON0bits.GO_DONE = 1; // Inicia a conversï¿½o A/D
+        while (ADCON0bits.GO_DONE);
+        int Valor_conversor = 256 * ADRESH + ADRESL;
+       
+        // Valor_conversor = 3V / 4,887585mV = 409,2 = 613
+        if (Valor_conversor >= 613) {
+            PORTDbits.RD0 = 1; // acende LED
+        } else {
+            PORTDbits.RD0 = 0; // apaga LED
+        }
+        
+         sprintf(buffer, "%.2f", Valor_conversor);
+        WriteCmdXLCD(0xC4);
+        putsXLCD(buffer);
+        putcXLCD('H');
+        putcXLCD('z');
                 break;
 
             case 1:
@@ -110,6 +133,7 @@ void main(void)
                 putsXLCD("  Iluminacao");
                 WriteCmdXLCD(0xC0);
                 putsXLCD("> Temperatura");
+                
                 break;
 
             case 2:
@@ -130,5 +154,77 @@ void main(void)
         menu_anterior = menu;
     }
 
-   }
-}
+    if(menu != menu_anterior)
+    {
+        WriteCmdXLCD(0x01);
+        __delay_ms(2);
+        //if((PORTBbits.RB1 == 0)||(PORTBbits.RB1 == 0)||(PORTBbits.RB1 == 0)){
+        switch(menu)
+        {
+            case 0:
+               ADCON0bits.GO_DONE = 1; // Inicia a conversï¿½o A/D
+                while (ADCON0bits.GO_DONE);
+                int Valor_conversor = 256 * ADRESH + ADRESL;
+       
+                // Valor_conversor = 3V / 4,887585mV = 409,2 = 613
+                 if (Valor_conversor >= 613) {
+                PORTDbits.RD0 = 1; // acende LED
+                } else {
+                PORTDbits.RD0 = 0; // apaga LED
+                 }
+                
+               WriteCmdXLCD(0x80);
+                putsXLCD();
+                WriteCmdXLCD(0xC0);
+                putsXLCD();
+                break;
+
+            case 1:
+                WriteCmdXLCD(0x80);
+                putsXLCD("  Iluminacao");
+                WriteCmdXLCD(0xC0);
+                putsXLCD("> Temperatura");
+                
+                break;
+
+            case 2:
+                WriteCmdXLCD(0x80);
+                putsXLCD("> Ventilacao");
+                WriteCmdXLCD(0xC0);
+                putsXLCD("  Configuracao");
+                break;
+
+            case 3:
+                WriteCmdXLCD(0x80);
+                putsXLCD("  Ventilacao");
+                WriteCmdXLCD(0xC0);
+                putsXLCD("> Configuracao");
+                break;
+        }
+
+        menu_anterior = menu;
+    }
+    
+    
+    
+    }
+    
+    
+   // }
+    }
+//}
+
+/*
+    TRISC = 0b00000100;
+    ADCON0 = Ob00001001;
+
+        ADCON0bits.GO_DONE = 1; // Inicia a conversï¿½o A/D
+        while (ADCON0bits.GO_DONE);
+        Valor_conversor = 256 * ADRESH + ADRESL;
+       
+        // Valor_conversor = 3V / 4,887585mV = 409,2 = 613
+        if (Valor_conversor >= 613) {
+            PORTDbits.RD0 = 1; // acende LED
+        } else {
+            PORTDbits.RD0 = 0; // apaga LED
+        }*/
