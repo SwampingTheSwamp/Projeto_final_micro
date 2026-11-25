@@ -1,0 +1,604 @@
+/*
+ * Automacao residencial - PIC18F4550 no kit XM118
+ *
+ * Ligacoes / dip switches:
+ *   Botoes   : RB0, RB1, RB2 (SW4, SW5, SW6) - dips do PORTB (CH6) em OFF
+ *   Luzes    : RD0, RD1, RD2 (LEDs do PORTD, ativos em nivel baixo no kit)
+ *   LM35     : RA0/AN0   -> CH1 chave 7 (TEMP) ON
+ *   Ventoinha: RC2/CCP1  -> CH3 chave 5 (VENTILADOR) ON (PWM)
+ *   Tacografo: RC0/T1CKI -> CH3 chave 2 (TACOGRAFO) ON
+ *   LCD      : conforme nxlcd.h -> CH2 chave 1 ON, bicolores (CH2 5..8) OFF
+ */
+
+#include <xc.h>
+#include <stdint.h>
+#include <stdio.h>
+#include "nxlcd.h"
+
+#pragma config CPUDIV = OSC1_PLL2
+#pragma config FOSC = HS
+#pragma config WDT = OFF
+#pragma config PBADEN = OFF
+#pragma config LVP = OFF
+#pragma config DEBUG = OFF
+#pragma config MCLRE = ON
+
+#define _XTAL_FREQ 20000000
+
+// ---------- Configuracoes ----------
+#define BTN_RB0  0x01
+#define BTN_RB1  0x02
+#define BTN_RB2  0x04
+
+#define NUM_AMB          3
+#define NIVEL_ON         0      // kit XM118: LEDs ativos em nivel BAIXO (use 1 no Proteus se for ativo alto)
+
+// Segundos de cada unidade configurada nos timers:
+// 60 = minutos | 3600 = horas | 1 = segundos (bom para testar)
+#define SEG_POR_UNIDADE  60UL
+#define UNID_TXT         "min"
+#define CONT_MAX         99
+
+#define PULSOS_POR_VOLTA 7      // numero de pas da ventoinha (ajuste para calibrar o rpm)
+
+#define MODO_AUTO        0
+#define MODO_LIGADA      1
+#define MODO_DESLIGADA   2
+
+// Enderecos da EEPROM interna
+#define EE_MAGIC   0
+#define EE_LIMITE  1
+#define EE_MODO    2
+#define EE_VEL     3
+
+// ---------- Variaveis globais ----------
+volatile uint32_t t_on[NUM_AMB];     // segundos ate ligar  (0 = sem timer)
+volatile uint32_t t_off[NUM_AMB];    // segundos ate desligar (0 = sem timer)
+volatile uint8_t  luz[NUM_AMB];      // estado desejado de cada luz
+volatile uint8_t  tick = 0;          // ISR avisa: passou 1 segundo
+volatile uint16_t pulsos = 0;        // pulsos do tacografo no ultimo segundo
+volatile uint8_t  evento_amb = 0;    // 0 = nada | n = ambiente (n-1) mudou pelo timer
+volatile uint8_t  evento_est = 0;    // novo estado da luz do evento
+
+uint16_t temp_dec = 0;               // temperatura em decimos de grau
+uint16_t rpm_atual = 0;
+uint8_t  fan_on = 0;
+
+uint8_t  limite = 30;                // limite de temperatura (C)
+uint8_t  modo = MODO_AUTO;
+uint8_t  vel = 100;                  // velocidade da ventoinha (%)
+
+char lcd_buf[17];
+char num_buf[24];
+
+const char *nome_amb[NUM_AMB] = {"Sala", "Quarto", "Cozinha"};
+const char *nome_modo[3]      = {"AUTO", "LIGADA", "DESLIG."};
+const char *itens_menu[5]     = {"Iluminacao", "Temperatura", "Ventilacao", "Timers", "Limite temp."};
+#define NUM_ITENS 5
+
+// ---------- Interrupcao: 1 segundo ----------
+void __interrupt() ISR(void)
+{
+    if(INTCONbits.TMR0IF == 1)
+    {
+        uint8_t i;
+        uint16_t p;
+
+        TMR0H = 0x67;
+        TMR0L = 0x69;
+        INTCONbits.TMR0IF = 0;
+
+        for(i = 0; i < NUM_AMB; i++)
+        {
+            if(t_on[i] > 0)
+            {
+                t_on[i]--;
+                if(t_on[i] == 0)
+                {
+                    luz[i] = 1;
+                    evento_amb = i + 1;
+                    evento_est = 1;
+                }
+            }
+            if(t_off[i] > 0)
+            {
+                t_off[i]--;
+                if(t_off[i] == 0)
+                {
+                    luz[i] = 0;
+                    evento_amb = i + 1;
+                    evento_est = 0;
+                }
+            }
+        }
+
+        // Tacografo: le e zera o Timer1 (RD16 = 1: ler L primeiro, escrever H primeiro)
+        p = TMR1L;
+        p |= ((uint16_t)TMR1H << 8);
+        TMR1H = 0;
+        TMR1L = 0;
+        pulsos = p;
+
+        tick = 1;
+    }
+}
+
+// ---------- EEPROM interna ----------
+uint8_t eeprom_le(uint8_t end)
+{
+    EEADR = end;
+    EECON1bits.EEPGD = 0;
+    EECON1bits.CFGS = 0;
+    EECON1bits.RD = 1;
+    return EEDATA;
+}
+
+void eeprom_grava(uint8_t end, uint8_t dado)
+{
+    uint8_t gie = INTCONbits.GIE;
+
+    EEADR = end;
+    EEDATA = dado;
+    EECON1bits.EEPGD = 0;
+    EECON1bits.CFGS = 0;
+    EECON1bits.WREN = 1;
+
+    INTCONbits.GIE = 0;
+    EECON2 = 0x55;
+    EECON2 = 0xAA;
+    EECON1bits.WR = 1;
+    INTCONbits.GIE = gie;
+
+    while(EECON1bits.WR);
+    PIR2bits.EEIF = 0;
+    EECON1bits.WREN = 0;
+}
+
+void salva_config(void)
+{
+    eeprom_grava(EE_LIMITE, limite);
+    eeprom_grava(EE_MODO, modo);
+    eeprom_grava(EE_VEL, vel);
+    eeprom_grava(EE_MAGIC, 0xA5);
+}
+
+void carrega_config(void)
+{
+    if(eeprom_le(EE_MAGIC) == 0xA5)
+    {
+        limite = eeprom_le(EE_LIMITE);
+        modo   = eeprom_le(EE_MODO);
+        vel    = eeprom_le(EE_VEL);
+
+        if(limite < 15 || limite > 60) limite = 30;
+        if(modo > 2) modo = MODO_AUTO;
+        if(vel < 25 || vel > 100) vel = 100;
+    }
+}
+
+// ---------- LCD ----------
+void lcd_linha(uint8_t linha, const char *txt)
+{
+    uint8_t i = 0;
+
+    while(i < 16 && txt[i] != '\0')
+    {
+        lcd_buf[i] = txt[i];
+        i++;
+    }
+    while(i < 16)
+    {
+        lcd_buf[i] = ' ';
+        i++;
+    }
+    lcd_buf[16] = '\0';
+
+    WriteCmdXLCD(linha == 0 ? 0x80 : 0xC0);
+    putsXLCD(lcd_buf);
+}
+
+// Retorna 1 uma unica vez por clique (debounce + espera soltar)
+uint8_t pressionado(uint8_t mascara)
+{
+    if((PORTB & mascara) == 0)
+    {
+        __delay_ms(30);
+        if((PORTB & mascara) == 0)
+        {
+            while((PORTB & mascara) == 0);
+            __delay_ms(30);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// ---------- Luzes (somente liga/desliga, sem PWM) ----------
+void escreve_led(uint8_t i, uint8_t ligado)
+{
+    uint8_t nivel = ligado ? NIVEL_ON : !NIVEL_ON;
+
+    switch(i)
+    {
+        case 0: LATDbits.LATD0 = nivel; break;
+        case 1: LATDbits.LATD1 = nivel; break;
+        case 2: LATDbits.LATD2 = nivel; break;
+    }
+}
+
+void aplica_luzes(void)
+{
+    uint8_t i;
+    for(i = 0; i < NUM_AMB; i++)
+        escreve_led(i, luz[i]);
+}
+
+// ---------- Temperatura (LM35 em AN0) ----------
+// Retorna a temperatura em decimos de grau Celsius (ex.: 275 = 27,5 C)
+uint16_t le_temperatura(void)
+{
+    uint32_t soma = 0;
+    uint8_t i;
+
+    for(i = 0; i < 8; i++)
+    {
+        ADCON0bits.GO = 1;
+        while(ADCON0bits.GO);
+        soma += ADRES;
+    }
+    soma >>= 3;
+
+    // mV = adc * 5000 / 1024 ; LM35 = 10 mV/C -> decimos de grau = mV
+    return (uint16_t)((soma * 5000UL) / 1024UL);
+}
+
+// ---------- Ventoinha (PWM no CCP1 / RC2) ----------
+void pwm_ventoinha(uint8_t pct)
+{
+    uint16_t d = ((uint16_t)pct * 5) / 2;   // 0..250 (PR2 = 249)
+    CCP1CONbits.DC1B = 0;
+    CCPR1L = (uint8_t)d;
+}
+
+void controle_ventoinha(void)
+{
+    uint16_t lim = (uint16_t)limite * 10;
+
+    if(modo == MODO_AUTO)
+    {
+        if(temp_dec >= lim)
+            fan_on = 1;
+        else if(temp_dec + 10 <= lim)       // histerese de 1 C
+            fan_on = 0;
+    }
+    else
+    {
+        fan_on = (modo == MODO_LIGADA);
+    }
+
+    pwm_ventoinha(fan_on ? vel : 0);
+}
+
+// ---------- Tarefas de fundo (chamadas em todos os loops) ----------
+void tarefas(void)
+{
+    uint16_t p;
+
+    aplica_luzes();
+
+    if(tick)
+    {
+        tick = 0;
+
+        di();
+        p = pulsos;
+        ei();
+        rpm_atual = (uint16_t)(((uint32_t)p * 60UL) / PULSOS_POR_VOLTA);
+
+        temp_dec = le_temperatura();
+        controle_ventoinha();
+    }
+}
+
+// ---------- Menu ----------
+void desenha_menu(int menu)
+{
+    char tmp[20];
+    uint8_t primeiro = (uint8_t)menu & 0xFE;
+
+    sprintf(tmp, "%c %s", (menu == primeiro) ? '>' : ' ', itens_menu[primeiro]);
+    lcd_linha(0, tmp);
+
+    if(primeiro + 1 < NUM_ITENS)
+    {
+        sprintf(tmp, "%c %s", (menu == primeiro + 1) ? '>' : ' ', itens_menu[primeiro + 1]);
+        lcd_linha(1, tmp);
+    }
+    else
+    {
+        lcd_linha(1, "");
+    }
+}
+
+// Ajuste generico de um valor: RB0 diminui, RB1 aumenta, RB2 confirma
+void ajusta_valor(const char *titulo, uint8_t *v, uint8_t vmin, uint8_t vmax, const char *unid)
+{
+    lcd_linha(0, titulo);
+
+    while(1)
+    {
+        tarefas();
+
+        sprintf(num_buf, "%u %s", *v, unid);
+        lcd_linha(1, num_buf);
+
+        if(pressionado(BTN_RB0))
+        {
+            if(*v > vmin) (*v)--;
+        }
+        if(pressionado(BTN_RB1))
+        {
+            if(*v < vmax) (*v)++;
+        }
+        if(pressionado(BTN_RB2))
+            return;
+    }
+}
+
+// ---------- Telas ----------
+
+void tela_luz(void)
+{
+    uint8_t a = 0;
+
+    lcd_linha(1, "Prox   Alt   Sai");
+
+    while(1)
+    {
+        tarefas();
+
+        sprintf(num_buf, "%s: %s", nome_amb[a], luz[a] ? "lig." : "desl.");
+        lcd_linha(0, num_buf);
+
+        if(pressionado(BTN_RB0))
+        {
+            a++;
+            if(a >= NUM_AMB) a = 0;
+        }
+
+        if(pressionado(BTN_RB1))
+            luz[a] = !luz[a];
+
+        if(pressionado(BTN_RB2))
+            return;
+    }
+}
+
+void tela_temperatura(void)
+{
+    uint16_t ultimo = 0xFFFF;
+
+    sprintf(num_buf, "Limite: %u C", limite);
+    lcd_linha(1, num_buf);
+
+    while(!pressionado(BTN_RB2))
+    {
+        tarefas();
+
+        if(temp_dec != ultimo)
+        {
+            ultimo = temp_dec;
+            sprintf(num_buf, "Temp: %u.%u C", temp_dec / 10, temp_dec % 10);
+            lcd_linha(0, num_buf);
+        }
+    }
+}
+
+void tela_ventilacao(void)
+{
+    while(1)
+    {
+        tarefas();
+
+        sprintf(num_buf, "%s %u%%", nome_modo[modo], vel);
+        lcd_linha(0, num_buf);
+
+        sprintf(num_buf, "%u rpm %s", rpm_atual, fan_on ? "ON" : "OFF");
+        lcd_linha(1, num_buf);
+
+        if(pressionado(BTN_RB0))        // muda o modo
+        {
+            modo++;
+            if(modo > 2) modo = 0;
+            controle_ventoinha();
+            salva_config();
+        }
+
+        if(pressionado(BTN_RB1))        // muda a velocidade
+        {
+            if(vel >= 100) vel = 25;
+            else vel += 25;
+            controle_ventoinha();
+            salva_config();
+        }
+
+        if(pressionado(BTN_RB2))
+            return;
+    }
+}
+
+void tela_timer(void)
+{
+    uint8_t a = 0;
+    uint8_t on_v = 0, off_v = 0;
+
+    // 1) escolhe o ambiente
+    lcd_linha(0, "Prox    OK   Sai");
+    while(1)
+    {
+        tarefas();
+        lcd_linha(1, nome_amb[a]);
+
+        if(pressionado(BTN_RB0))
+        {
+            a++;
+            if(a >= NUM_AMB) a = 0;
+        }
+        if(pressionado(BTN_RB1))
+            break;
+        if(pressionado(BTN_RB2))
+            return;
+    }
+
+    // 2) tempos (0 = sem timer)
+    ajusta_valor("Ligar apos:", &on_v, 0, CONT_MAX, UNID_TXT);
+    ajusta_valor("Desligar apos:", &off_v, 0, CONT_MAX, UNID_TXT);
+
+    // Desligar precisa vir depois de ligar
+    if(on_v > 0 && off_v > 0 && off_v <= on_v)
+    {
+        lcd_linha(0, "Erro: desligar");
+        lcd_linha(1, "deve ser > ligar");
+        __delay_ms(1500);
+        return;
+    }
+
+    di();
+    t_on[a]  = (uint32_t)on_v  * SEG_POR_UNIDADE;
+    t_off[a] = (uint32_t)off_v * SEG_POR_UNIDADE;
+    ei();
+
+    lcd_linha(0, nome_amb[a]);
+    lcd_linha(1, (on_v > 0 || off_v > 0) ? "Timer salvo" : "Timer cancelado");
+    __delay_ms(1000);
+}
+
+void tela_limite(void)
+{
+    ajusta_valor("Limite temp:", &limite, 15, 60, "C");
+    salva_config();
+    controle_ventoinha();
+
+    lcd_linha(0, "Limite salvo");
+    lcd_linha(1, "");
+    __delay_ms(800);
+}
+
+// ---------- Programa principal ----------
+void main(void)
+{
+    int menu = 0;
+    uint8_t i;
+
+    // Portas
+    TRISA = 0xFF;               // RA0 = LM35
+    TRISB = 0xFF;               // RB0..RB2 = botoes
+    TRISC = 0b00000001;         // RC0 = tacografo (entrada), RC2 = PWM (saida)
+    TRISD = 0x00;
+    TRISE = 0x00;
+
+    INTCON2bits.RBPU = 0;       // pull-ups internos do PORTB
+
+    // ADC: somente AN0 analogico, Vref = VDD/VSS, resultado justificado a direita
+    ADCON1 = 0b00001110;
+    ADCON2 = 0b10101110;        // ADFM=1, Tacq = 12 TAD, Fosc/64
+    ADCON0 = 0b00000001;        // canal AN0, ADC ligado
+
+    // PWM da ventoinha (CCP1 em RC2): ~1,25 kHz
+    PR2 = 249;
+    CCPR1L = 0;
+    CCP1CON = 0b00001100;
+    T2CON = 0b00000111;         // Timer2 ligado, prescaler 1:16
+
+    // Timer1 como contador de pulsos do tacografo (RC0/T1CKI)
+    T1CON = 0b10000111;         // RD16=1, prescaler 1:1, clock externo, sem sincronismo, ligado
+    TMR1H = 0;
+    TMR1L = 0;
+
+    // Estado inicial
+    for(i = 0; i < NUM_AMB; i++)
+    {
+        luz[i] = 0;
+        t_on[i] = 0;
+        t_off[i] = 0;
+    }
+    aplica_luzes();
+    carrega_config();
+
+    // Timer0: 16 bits, Fosc/4, prescaler 1:128 -> estouro a cada ~1 s
+    T0CONbits.T08BIT = 0;
+    T0CONbits.T0CS = 0;
+    T0CONbits.PSA = 0;
+    T0CONbits.T0PS = 0b110;
+    TMR0H = 0x67;
+    TMR0L = 0x69;
+
+    INTCONbits.TMR0IF = 0;
+    INTCONbits.TMR0IE = 1;
+    INTCONbits.PEIE = 1;
+    INTCONbits.GIE = 1;
+
+    T0CONbits.TMR0ON = 1;
+
+    // Primeira leitura de temperatura
+    temp_dec = le_temperatura();
+    controle_ventoinha();
+
+    // LCD
+    OpenXLCD(FOUR_BIT & LINES_5X7);
+    WriteCmdXLCD(0x01);
+    __delay_ms(2);
+    WriteCmdXLCD(0x0C);
+
+    lcd_linha(0, " Menu da casa");
+    lcd_linha(1, "   Bem vindo");
+    __delay_ms(1000);
+
+    desenha_menu(menu);
+
+    while(1)
+    {
+        tarefas();
+
+        if(evento_amb)
+        {
+            uint8_t a = evento_amb - 1;
+            uint8_t e = evento_est;
+            evento_amb = 0;
+
+            lcd_linha(0, nome_amb[a]);
+            lcd_linha(1, e ? "ligada p/ timer" : "desl. p/ timer");
+            __delay_ms(1500);
+            desenha_menu(menu);
+        }
+
+        if(pressionado(BTN_RB0))
+        {
+            menu++;
+            if(menu >= NUM_ITENS)
+                menu = 0;
+            desenha_menu(menu);
+        }
+
+        if(pressionado(BTN_RB1))
+        {
+            menu--;
+            if(menu < 0)
+                menu = NUM_ITENS - 1;
+            desenha_menu(menu);
+        }
+
+        if(pressionado(BTN_RB2))
+        {
+            switch(menu)
+            {
+                case 0: tela_luz();         break;
+                case 1: tela_temperatura(); break;
+                case 2: tela_ventilacao();  break;
+                case 3: tela_timer();       break;
+                case 4: tela_limite();      break;
+            }
+            desenha_menu(menu);
+        }
+    }
+}
